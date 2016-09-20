@@ -35,6 +35,11 @@ Slave::Slave(SSDB *ssdb, SSDB *meta, const char *ip, int port, bool is_mirror){
 	
 	this->copy_count = 0;
 	this->sync_count = 0;
+
+	this->reqlog = NULL;
+	this->use_reqlog = false;
+	this->work_dir = "";
+
 }
 
 Slave::~Slave(){
@@ -45,6 +50,10 @@ Slave::~Slave(){
 	if(link){
 		delete link;
 	}
+	if(reqlog){
+		delete reqlog;
+	}
+
 	log_debug("Slave finalized");
 }
 
@@ -57,6 +66,12 @@ std::string Slave::stats() const{
 	}else{
 		s.append("    type       : sync\n");
 	}
+	if(use_reqlog){
+	s.append("    use_reqlog : yes\n");
+	}else {
+	s.append("    use_reqlog : no\n");
+	}
+
 
 	s.append("    status     : ");
 	switch(status){
@@ -90,6 +105,20 @@ void Slave::start(){
 		last_seq, hexmem(last_key.data(), last_key.size()).c_str());
 
 	thread_quit = false;
+
+	if (use_reqlog )
+	{
+		reqlog = new ReqlogFile(work_dir);
+		if(reqlog->init() != 1){
+			log_fatal("Init reqlog fail.");
+			exit(1);
+		}
+		int err = pthread_create(&reqlog_thread_tid, NULL, &Slave::_reqlog_thread, this);
+		if(err != 0){
+			log_error("can't create thread: %s", strerror(err));
+		}
+	}
+
 	int err = pthread_create(&run_thread_tid, NULL, &Slave::_run_thread, this);
 	if(err != 0){
 		log_error("can't create thread: %s", strerror(err));
@@ -102,6 +131,14 @@ void Slave::stop(){
 	int err = pthread_join(run_thread_tid, &tret);
     if(err != 0){
 		log_error("can't join thread: %s", strerror(err));
+	}
+
+	if (reqlog != NULL)
+	{
+		err = pthread_join(reqlog_thread_tid, &tret);
+		if(err != 0){
+			log_error("can't join thread: %s", strerror(err));
+		}
 	}
 }
 
@@ -186,6 +223,7 @@ int Slave::connect(){
 			}
 			
 			link->send("sync140", str(this->last_seq), this->last_key, type);
+			log_debug("sync140 last_seq: %"PRIu64", last_key: %s, type: %d", this->last_seq, this->last_key.c_str(), type);
 			if(link->flush() == -1){
 				log_error("[%s] network error", this->id_.c_str());
 				delete link;
@@ -265,7 +303,11 @@ void* Slave::_run_thread(void *arg){
 				reconnect = true;
 				sleep(1);
 				break;
-			}else{
+			}else if(slave->use_reqlog){
+				if(slave->reqlog->proc(*req) == -1){
+					goto err;
+				}
+			}else {
 				if(slave->proc(*req) == -1){
 					goto err;
 				}
@@ -518,5 +560,191 @@ int Slave::proc_sync(const Binlog &log, const std::vector<Bytes> &req){
 	}
 	this->save_status();
 	return 0;
+}
+void *Slave::_reqlog_thread(void* arg){
+	Slave *slave = (Slave*)arg;
+	int result = 0;
+	while(!slave->thread_quit){
+		std::vector<Bytes> req;
+		result = slave->reqlog->read_req_from_file(&req);
+		if (result == -1)
+			goto err;
+		if (result == 0)
+			usleep(50 * 1000);
+		else 
+		{
+			if (slave->proc(req) == -1)
+				goto err;
+		}
+	}
+	log_info("Slave thread quit");
+	return (void *)NULL;
+
+err:
+	log_fatal("Slave thread exit unexpectedly");
+	exit(0);
+	return (void *)NULL;;
+
+}
+int ReqlogFile::init(){
+	log_debug("ReqlogFile::init()");
+	req_max_file_size = 500 * 1024 * 1024 ;//default 500M every reqlog file
+	log_debug("read_offset: %"PRIu64", write_offset: %"PRIu64", read_file_index: %"PRIu64" ,write_file_index: %"PRIu64,
+		read_offset,write_offset,read_file_index,write_file_index);
+	write_fd = open(reqlog_filename(write_file_index ).c_str(), O_WRONLY|O_CREAT|O_APPEND|O_TRUNC,00644);
+	if (write_fd < 0){
+		log_error("open reqlog file %"PRIu64" for write fail. error : %s",write_file_index,strerror(errno));
+		return -1;
+	}
+	log_debug("init open reqlog file:%s to write", reqlog_filename(write_file_index ).c_str());
+	read_fd = open(reqlog_filename(read_file_index).c_str(),O_RDONLY);
+	if (read_fd < 0){
+		log_error("open reqlog file %"PRIu64" for read fail. error: %s",read_file_index,strerror(errno));
+		return -1;
+	}
+
+	log_info("reqlog->work_dir:%s",work_dir.c_str());
+	log_info("reqlog->last_key:%s",last_key.c_str());
+	log_info("reqlog->last_seq:%lld",last_seq);
+	log_info("reqlog->req_max_file_size:%lld",req_max_file_size);
+	log_info("reqlog->read_offset:%lld",read_offset);
+	log_info("reqlog->read_file_index:%lld",read_file_index);
+	log_info("reqlog->write_offset:%lld",write_offset);
+	log_info("reqlog->write_file_index:%lld",write_file_index);
+	return 1;
+
+}
+int ReqlogFile::proc(const std::vector<Bytes> &req){
+	Binlog log;
+	if(log.load(req[0])){
+		log_error("invalid binlog!");
+		return -1;
+	}
+	Buffer buf(8);
+	for(std::vector<Bytes>::const_iterator it = req.begin(); it != req.end();it++){
+		buf.append_record(*it);
+		log_debug("write req:[]{%s}",hexmem(it->data(),it->size()).c_str());
+	}
+	int len = buf.size();
+	if (write(write_fd,(void*)&len,sizeof(len)) != sizeof(len)){
+		log_error("write to reqlog file fail. error: %s", strerror(errno));
+		return -1;
+	}
+	if (write(write_fd,buf.data(),len) != len){
+		log_error("write to reqlog file fail. error: %s", strerror(errno));
+		return -1;
+	}
+	write_offset+= len + sizeof(len);
+	write_count++;
+	int64_t size = write_count - read_count;
+	switch(log.cmd()){
+		case BinlogCommand::BEGIN:
+			log_info("reqlog copy begin");
+			last_seq = 0;
+			last_key = "";
+			break;
+		case BinlogCommand::END:
+			log_info("reqlog copy end, copy_count: %"PRIu64 ", sync_count: %"PRIu64 " last_seq: %"PRIu64 ", seq: %"PRIu64,
+				copy_count, sync_count, last_seq, log.seq());
+			last_key = "";
+			break;
+		default:{
+			switch(log.type()){
+				case BinlogType::NOOP:
+						last_seq = log.seq();
+					break;
+				case BinlogType::COPY:{
+					if(++copy_count % 1000 == 1){
+						log_info("write log copy_count: %" PRIu64 ", last_seq: %" PRIu64 ", seq: %" PRIu64 ", size: %" PRIu64,
+							copy_count, last_seq, log.seq(), size);
+					}
+					last_seq = log.seq();
+					last_key = log.key().String();
+					break;
+				}
+				case BinlogType::SYNC:
+				case BinlogType::MIRROR:{
+					if(++sync_count % 1000 == 1){
+						log_info("write log sync_count: %" PRIu64 ", last_seq: %" PRIu64 ", seq: %" PRIu64 "",
+							sync_count, last_seq, log.seq());
+					}
+					last_seq = log.seq();
+					break;
+				}
+				default:
+					break;
+			}
+			break;
+		}
+	}
+	log_debug("write one req success!buf.size(): %d, write_offset: %"PRIu64", count: %"PRIu64", size: %"PRIu64",req.size():%d",
+			buf.size(),write_offset,write_count,size,req.size());
+	
+	if(write_offset > req_max_file_size){
+		close(write_fd);
+		write_file_index++;
+		write_fd = open(reqlog_filename(write_file_index ).c_str(), O_WRONLY|O_CREAT|O_TRUNC|O_APPEND,00644);
+		if (write_fd < 0){
+			log_error("create reqlog file %"PRIu64" fail. error: %s", write_file_index, strerror(errno));
+			return -1;
+		}
+		log_debug("create new reqlog %s success",reqlog_filename(write_file_index ).c_str());
+		write_offset = 0;
+	}
+	return 1;
+
+}
+int ReqlogFile::read_req_from_file(std::vector<Bytes> *req)
+{
+	int64_t size = write_count - read_count;
+	if (read_offset >= write_offset && read_file_index >= write_file_index){
+		return 0;//no more new req
+	}
+	int body_len = 0;
+	ssize_t result = read(read_fd,&body_len,sizeof(body_len));
+	if(result != sizeof(body_len)){
+		log_error("read reqlog file fail. read_offset: %"PRIu64", write_offset: %"PRIu64", read_write_index: %"PRIu64", \
+				 write_file_index: %"PRIu64", size: %"PRIu64", result: %d, error: %s",
+				read_offset, write_offset, read_file_index, write_file_index, size, result, strerror(errno));
+		return -1;
+	}
+	char *read_buf = new char[body_len + 1];
+	Buffer buf(8);
+	if(read(read_fd, read_buf, body_len) != body_len){
+		log_error("read reqlog file %"PRIu64" fail.",read_file_index);
+		delete[] read_buf;
+		return -1;
+	}
+	int append_result = buf.append(read_buf,body_len);
+	if(append_result < body_len){
+		log_error("Buffer append [%s] fail.",hexmem(read_buf,body_len).c_str());
+		delete[] read_buf;
+		return -1;
+	}
+	while(1){
+		Bytes s;
+		if(buf.read_record(&s) != 1)
+			break;
+		req->push_back(s);
+	}
+	log_debug("read req success.read_offset: %"PRIu64 ", read_file_index: %"PRIu64 ", read_count: %"PRIu64 ", size: %"PRIu64,
+			read_offset,read_file_index,read_count,write_count - read_count);
+	delete[] read_buf;
+	read_offset += body_len + sizeof(body_len);
+	read_count ++;
+	if (read_offset > req_max_file_size){
+		//delete the old reqlog file,and open the next one
+		close(read_fd);
+		remove(reqlog_filename(read_file_index).c_str());
+		log_info("remove file: %s", reqlog_filename(read_file_index).c_str());
+		read_file_index++;
+		read_offset = 0;
+		read_fd = open(reqlog_filename(read_file_index).c_str(), O_RDONLY|O_SYNC);
+		if(read_fd < 0){
+			log_error("read reqlog file %"PRIu64" fail. error: %s", read_file_index, strerror(errno));
+			return -1;
+		}
+	}
+	return 1;
 }
 

@@ -312,6 +312,14 @@ SSDBServer::SSDBServer(SSDB *ssdb, SSDB *meta, const Config &conf, NetworkServer
 				if(!id.empty()){
 					slave->set_id(id);
 				}
+                slave->set_work_dir(conf.get_str("work_dir"));
+                if(conf.get_num("replication.use_reqlog") == 1){ 
+                    slave->set_use_reqlog(true);
+                }else{
+                    slave->set_use_reqlog(false);
+                }   
+
+
 				slave->auth = c->get_str("auth");
 				slave->start();
 				slaves.push_back(slave);

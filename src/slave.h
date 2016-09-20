@@ -14,6 +14,62 @@ found in the LICENSE file.
 #include "ssdb/binlog.h"
 #include "net/link.h"
 
+class ReqlogFile {
+	private:
+		int write_fd;
+		int read_fd;
+
+		volatile int64_t write_offset;
+		volatile int64_t write_file_index;
+		volatile int64_t write_count;
+		volatile int64_t read_offset;
+		volatile int64_t read_file_index;
+		volatile int64_t read_count;
+		volatile int64_t last_seq;
+		std::string last_key;
+		volatile uint64_t copy_count;
+		volatile uint64_t sync_count;
+
+		std::string work_dir;
+		uint64_t req_max_file_size;
+
+	public:
+		int64_t get_last_seq(){
+			return last_seq;
+		}
+		std::string get_last_key(){
+			return last_key;
+		}
+		ReqlogFile(const std::string& dir){
+			write_fd = -1;
+			read_fd = -1;
+			copy_count = 0;
+			sync_count = 0;
+			work_dir = dir;
+			req_max_file_size = 0;
+			read_offset = 0;
+			read_file_index = 0;
+			read_count = 0;
+			write_offset = 0;
+			write_file_index = 0;
+			write_count = 0;
+			last_seq = 0;
+			last_key = "";
+
+		};
+		int init();
+		int read_req_from_file(std::vector<Bytes> *req);
+		int proc(const std::vector<Bytes> &req);
+		std::string reqlog_filename(int index){
+			return work_dir + "/" + "reqlog." + str(index);
+		}
+		~ReqlogFile(){
+			close(write_fd);
+			close(read_fd);
+			log_debug("~ReqlogFile");
+		}
+};
+
 class Slave{
 private:
 	uint64_t last_seq;
@@ -38,6 +94,11 @@ private:
 	static const int OUT_OF_SYNC = 8;
 	int status;
 
+	ReqlogFile *reqlog;
+	bool use_reqlog;
+	std::string work_dir;
+
+
 	void migrate_old_status();
 
 	std::string status_key();
@@ -48,6 +109,10 @@ private:
 	pthread_t run_thread_tid;
 	static void* _run_thread(void *arg);
 		
+	pthread_t reqlog_thread_tid;
+	static void* _reqlog_thread(void* arg);
+
+
 	int proc(const std::vector<Bytes> &req);
 	int proc_noop(const Binlog &log, const std::vector<Bytes> &req);
 	int proc_copy(const Binlog &log, const std::vector<Bytes> &req);
@@ -67,6 +132,17 @@ public:
 		
 	void set_id(const std::string &id);
 	std::string stats() const;
+	void set_work_dir(const std::string &dir){
+		if(dir == ""){
+			work_dir = "./";
+		}else{
+			work_dir = dir;
+		}
+	}
+	void set_use_reqlog(bool on_off){
+		use_reqlog = on_off;
+	}
+
 };
 
 #endif
